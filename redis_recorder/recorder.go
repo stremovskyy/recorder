@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"sync"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 
@@ -105,6 +106,18 @@ func NewRedisRecorder(options *Options) recorder.Recorder {
 			ClientName: "RedisRecorder",
 		},
 	)
+
+	if options.DefaultTTL == 0 {
+		options.DefaultTTL = time.Hour * 24 * 7
+	}
+
+	if options.CompressionLvl == 0 {
+		options.CompressionLvl = gzip.DefaultCompression
+	}
+
+	if options.Prefix == "" {
+		options.Prefix = "RedisRecorder"
+	}
 
 	statusCmd := client.Ping(context.Background())
 	if statusCmd.Err() != nil {
