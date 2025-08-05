@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"sync"
@@ -37,7 +36,7 @@ func (r *fileRecorder) saveToFile(ctx context.Context, prefix, id string, data [
 		return fmt.Errorf("failed to create directories: %w", err)
 	}
 
-	return ioutil.WriteFile(path, data, 0644)
+	return os.WriteFile(path, data, 0644)
 }
 
 func (r *fileRecorder) loadFromFile(ctx context.Context, prefix, id string) ([]byte, error) {
@@ -45,7 +44,7 @@ func (r *fileRecorder) loadFromFile(ctx context.Context, prefix, id string) ([]b
 	defer r.mu.Unlock()
 
 	path := filepath.Join(r.basePath, prefix, id+".json")
-	data, err := ioutil.ReadFile(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read file %s: %w", path, err)
 	}

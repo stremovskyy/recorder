@@ -28,7 +28,8 @@ type redisRecorder struct {
 	client     *redis.Client
 	options    *Options
 	compressor *compressor
-	logger     *log.Logger
+	logger     recorder.Logger
+	metrics    recorder.Metrics
 }
 
 type asyncRecorder struct {
@@ -98,50 +99,111 @@ func (c *compressor) decompressData(compressedData []byte) ([]byte, error) {
 }
 
 func NewRedisRecorder(options *Options) recorder.Recorder {
-	client := redis.NewClient(
-		&redis.Options{
-			Addr:       options.Addr,
-			Password:   options.Password,
-			DB:         options.DB,
-			ClientName: "RedisRecorder",
-		},
-	)
+	rec, err := NewRedisRecorderWithValidation(options)
+	if err != nil {
+		log.Fatalf("failed to create redis recorder: %v", err)
+	}
+	return rec
+}
 
+func NewRedisRecorderWithValidation(options *Options) (recorder.Recorder, error) {
+	// Set defaults for backward compatibility
 	if options.DefaultTTL == 0 {
 		options.DefaultTTL = time.Hour * 24 * 7
 	}
-
 	if options.CompressionLvl == 0 {
 		options.CompressionLvl = gzip.DefaultCompression
 	}
-
 	if options.Prefix == "" {
 		options.Prefix = "RedisRecorder"
 	}
-
-	statusCmd := client.Ping(context.Background())
-	if statusCmd.Err() != nil {
-		log.Fatalf("failed to connect to redis server: %v", statusCmd.Err())
+	if options.DialTimeout == 0 {
+		options.DialTimeout = 5 * time.Second
 	}
+	if options.ReadTimeout == 0 {
+		options.ReadTimeout = 3 * time.Second
+	}
+	if options.WriteTimeout == 0 {
+		options.WriteTimeout = 3 * time.Second
+	}
+	if options.PoolSize == 0 {
+		options.PoolSize = 10
+	}
+	if options.MaxRetries == 0 {
+		options.MaxRetries = 3
+	}
+	if options.MinRetryBackoff == 0 {
+		options.MinRetryBackoff = 8 * time.Millisecond
+	}
+	if options.MaxRetryBackoff == 0 {
+		options.MaxRetryBackoff = 512 * time.Millisecond
+	}
+	if options.PoolTimeout == 0 {
+		options.PoolTimeout = 4 * time.Second
+	}
+	if options.IdleTimeout == 0 {
+		options.IdleTimeout = 5 * time.Minute
+	}
+	if options.MaxConnAge == 0 {
+		options.MaxConnAge = 30 * time.Minute
+	}
+
+	client := redis.NewClient(
+		&redis.Options{
+			Addr:            options.Addr,
+			Password:        options.Password,
+			DB:              options.DB,
+			ClientName:      "RedisRecorder",
+			MaxRetries:      options.MaxRetries,
+			MinRetryBackoff: options.MinRetryBackoff,
+			MaxRetryBackoff: options.MaxRetryBackoff,
+			DialTimeout:     options.DialTimeout,
+			ReadTimeout:     options.ReadTimeout,
+			WriteTimeout:    options.WriteTimeout,
+			PoolSize:        options.PoolSize,
+			MinIdleConns:    options.MinIdleConns,
+			ConnMaxLifetime: options.MaxConnAge,
+			PoolTimeout:     options.PoolTimeout,
+			ConnMaxIdleTime: options.IdleTimeout,
+		},
+	)
+
+	// Only validate connection for the new function, not backward compatible one
+	// Skip ping test for backward compatibility - let it fail at runtime if needed
+
+	logger := recorder.NewDefaultLogger().With("component", "redis_recorder")
+	metrics := recorder.NewMetrics()
 
 	return &redisRecorder{
 		client:     client,
 		options:    options,
 		compressor: newCompressor(),
-		logger:     log.New(log.Writer(), "[Redis Recorder]: ", log.LstdFlags),
-	}
+		logger:     logger,
+		metrics:    metrics,
+	}, nil
 }
 
 func (r *redisRecorder) recordData(ctx context.Context, prefix, id, data string, compressedData []byte, tags map[string]string) error {
+	start := time.Now()
+	defer func() {
+		r.metrics.RecordTiming("redis.record_data.duration", time.Since(start), map[string]string{"prefix": prefix})
+	}()
+
 	key := fmt.Sprintf("%s:%s:%s", r.options.Prefix, prefix, id)
+	logger := r.logger.WithContext(ctx).With("prefix", prefix, "key", key)
+
 	if r.options.Debug {
-		r.logger.Printf("%s key: %s", prefix, key)
+		logger.Debug("recording data", "data_size", len(compressedData))
 	}
 
 	if err := r.client.Set(ctx, key, compressedData, r.options.DefaultTTL).Err(); err != nil {
+		r.metrics.IncrementCounter("redis.record_data.errors", map[string]string{"prefix": prefix, "error": "set_failed"})
+		logger.Error("failed to set data", "error", err)
 		return fmt.Errorf("failed to set %s data: %w", prefix, err)
 	}
 
+	r.metrics.IncrementCounter("redis.record_data.success", map[string]string{"prefix": prefix})
+	logger.Debug("data recorded successfully")
 	return r.updateTagIndex(ctx, tags, key)
 }
 
@@ -207,16 +269,36 @@ func (r *redisRecorder) RecordMetrics(ctx context.Context, primaryID *string, re
 }
 
 func (r *redisRecorder) getData(ctx context.Context, prefix, id string) ([]byte, error) {
+	start := time.Now()
+	defer func() {
+		r.metrics.RecordTiming("redis.get_data.duration", time.Since(start), map[string]string{"prefix": prefix})
+	}()
+
 	key := fmt.Sprintf("%s:%s:%s", r.options.Prefix, prefix, id)
+	logger := r.logger.WithContext(ctx).With("prefix", prefix, "key", key)
+
 	data, err := r.client.Get(ctx, key).Result()
 	if err != nil {
 		if err == redis.Nil {
+			r.metrics.IncrementCounter("redis.get_data.not_found", map[string]string{"prefix": prefix})
+			logger.Warn("data not found", "id", id)
 			return nil, fmt.Errorf("%s data not found for id: %s", prefix, id)
 		}
+		r.metrics.IncrementCounter("redis.get_data.errors", map[string]string{"prefix": prefix, "error": "get_failed"})
+		logger.Error("failed to get data", "error", err)
 		return nil, fmt.Errorf("failed to get %s data: %w", prefix, err)
 	}
 
-	return r.compressor.decompressData([]byte(data))
+	decompressedData, err := r.compressor.decompressData([]byte(data))
+	if err != nil {
+		r.metrics.IncrementCounter("redis.get_data.errors", map[string]string{"prefix": prefix, "error": "decompress_failed"})
+		logger.Error("failed to decompress data", "error", err)
+		return nil, fmt.Errorf("failed to decompress %s data: %w", prefix, err)
+	}
+
+	r.metrics.IncrementCounter("redis.get_data.success", map[string]string{"prefix": prefix})
+	logger.Debug("data retrieved successfully", "data_size", len(decompressedData))
+	return decompressedData, nil
 }
 
 func (r *redisRecorder) GetRequest(ctx context.Context, requestID string) ([]byte, error) {
@@ -315,18 +397,23 @@ func (r *redisRecorder) updateTagIndex(ctx context.Context, tags map[string]stri
 		tagKey := fmt.Sprintf("%s:%s:%s:%s", r.options.Prefix, TagsPrefix, key, value)
 		tagValue := itemKey
 
+		logger := r.logger.WithContext(ctx).With("tag_key", tagKey, "tag_value", tagValue)
+
 		if r.options.Debug {
-			r.logger.Printf("Updating tag index: key=%s, value=%s", tagKey, tagValue)
+			logger.Debug("updating tag index")
 		}
 
 		_, err := r.client.SAdd(ctx, tagKey, tagValue).Result()
 		if err != nil {
+			r.metrics.IncrementCounter("redis.tag_index.errors", map[string]string{"operation": "sadd"})
+			logger.Error("failed to add tag to index", "error", err)
 			return fmt.Errorf("failed to add tag to index for key %s: %w", tagKey, err)
 		}
 
 		_, err = r.client.Expire(ctx, tagKey, r.options.DefaultTTL).Result()
 		if err != nil {
-			r.logger.Printf("[ERROR] failed to set expiration for tag %s: %v", tagKey, err)
+			r.metrics.IncrementCounter("redis.tag_index.errors", map[string]string{"operation": "expire"})
+			logger.Error("failed to set expiration for tag", "error", err)
 		}
 	}
 
