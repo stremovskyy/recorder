@@ -81,8 +81,8 @@ func (o *Options) Validate() error {
 	if o.DefaultTTL <= 0 {
 		return fmt.Errorf("default TTL must be positive")
 	}
-	if o.CompressionLvl < 0 || o.CompressionLvl > 9 {
-		return fmt.Errorf("compression level must be between 0 and 9")
+	if o.CompressionLvl < -1 || o.CompressionLvl > 9 {
+		return fmt.Errorf("compression level must be between -1 and 9")
 	}
 	if o.Prefix == "" {
 		return fmt.Errorf("prefix cannot be empty")

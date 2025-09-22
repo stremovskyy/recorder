@@ -1,6 +1,8 @@
 package recorder
 
 import (
+	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -93,9 +95,24 @@ func (m *inMemoryMetrics) GetHistograms() map[string][]float64 {
 }
 
 func (m *inMemoryMetrics) buildKey(name string, tags map[string]string) string {
-	key := name
-	for k, v := range tags {
-		key += "," + k + "=" + v
+	if len(tags) == 0 {
+		return name
 	}
-	return key
+
+	keys := make([]string, 0, len(tags))
+	for k := range tags {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	var b strings.Builder
+	b.Grow(len(name) + len(keys)*8) // rough pre-alloc to reduce reallocations
+	b.WriteString(name)
+	for _, k := range keys {
+		b.WriteByte(',')
+		b.WriteString(k)
+		b.WriteByte('=')
+		b.WriteString(tags[k])
+	}
+	return b.String()
 }

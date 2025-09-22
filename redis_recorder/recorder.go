@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -32,11 +31,7 @@ type redisRecorder struct {
 	metrics    recorder.Metrics
 }
 
-type asyncRecorder struct {
-	*redisRecorder
-}
-
-var _ recorder.Recorder = (*redisRecorder)(nil)
+var _ recorder.Storage = (*redisRecorder)(nil)
 
 type compressor struct {
 	bufferPool sync.Pool
@@ -71,7 +66,10 @@ func (c *compressor) compressData(data []byte, lvl int) ([]byte, error) {
 		return nil, err
 	}
 
-	return buf.Bytes(), nil
+	compressed := buf.Bytes()
+	result := make([]byte, len(compressed))
+	copy(result, compressed)
+	return result, nil
 }
 
 func (c *compressor) decompressData(compressedData []byte) ([]byte, error) {
@@ -101,13 +99,61 @@ func (c *compressor) decompressData(compressedData []byte) ([]byte, error) {
 func NewRedisRecorder(options *Options) recorder.Recorder {
 	rec, err := NewRedisRecorderWithValidation(options)
 	if err != nil {
-		log.Fatalf("failed to create redis recorder: %v", err)
+		log.Printf("failed to create redis recorder: %v", err)
+		return nil
 	}
 	return rec
 }
 
 func NewRedisRecorderWithValidation(options *Options) (recorder.Recorder, error) {
-	// Set defaults for backward compatibility
+	if options == nil {
+		return nil, fmt.Errorf("redis recorder: options must not be nil")
+	}
+
+	applyRedisDefaults(options)
+	if err := options.Validate(); err != nil {
+		return nil, err
+	}
+	cfg := *options
+
+	client := redis.NewClient(
+		&redis.Options{
+			Addr:            cfg.Addr,
+			Password:        cfg.Password,
+			DB:              cfg.DB,
+			ClientName:      "RedisRecorder",
+			MaxRetries:      cfg.MaxRetries,
+			MinRetryBackoff: cfg.MinRetryBackoff,
+			MaxRetryBackoff: cfg.MaxRetryBackoff,
+			DialTimeout:     cfg.DialTimeout,
+			ReadTimeout:     cfg.ReadTimeout,
+			WriteTimeout:    cfg.WriteTimeout,
+			PoolSize:        cfg.PoolSize,
+			MinIdleConns:    cfg.MinIdleConns,
+			ConnMaxLifetime: cfg.MaxConnAge,
+			PoolTimeout:     cfg.PoolTimeout,
+			ConnMaxIdleTime: cfg.IdleTimeout,
+		},
+	)
+
+	// Only validate connection for the new function, not backward compatible one
+	// Skip ping test for backward compatibility - let it fail at runtime if needed
+
+	logger := recorder.NewDefaultLogger().With("component", "redis_recorder")
+	metrics := recorder.NewMetrics()
+
+	storage := &redisRecorder{
+		client:     client,
+		options:    options,
+		compressor: newCompressor(),
+		logger:     logger,
+		metrics:    metrics,
+	}
+
+	return recorder.New(storage), nil
+}
+
+func applyRedisDefaults(options *Options) {
 	if options.DefaultTTL == 0 {
 		options.DefaultTTL = time.Hour * 24 * 7
 	}
@@ -147,43 +193,83 @@ func NewRedisRecorderWithValidation(options *Options) (recorder.Recorder, error)
 	if options.MaxConnAge == 0 {
 		options.MaxConnAge = 30 * time.Minute
 	}
-
-	client := redis.NewClient(
-		&redis.Options{
-			Addr:            options.Addr,
-			Password:        options.Password,
-			DB:              options.DB,
-			ClientName:      "RedisRecorder",
-			MaxRetries:      options.MaxRetries,
-			MinRetryBackoff: options.MinRetryBackoff,
-			MaxRetryBackoff: options.MaxRetryBackoff,
-			DialTimeout:     options.DialTimeout,
-			ReadTimeout:     options.ReadTimeout,
-			WriteTimeout:    options.WriteTimeout,
-			PoolSize:        options.PoolSize,
-			MinIdleConns:    options.MinIdleConns,
-			ConnMaxLifetime: options.MaxConnAge,
-			PoolTimeout:     options.PoolTimeout,
-			ConnMaxIdleTime: options.IdleTimeout,
-		},
-	)
-
-	// Only validate connection for the new function, not backward compatible one
-	// Skip ping test for backward compatibility - let it fail at runtime if needed
-
-	logger := recorder.NewDefaultLogger().With("component", "redis_recorder")
-	metrics := recorder.NewMetrics()
-
-	return &redisRecorder{
-		client:     client,
-		options:    options,
-		compressor: newCompressor(),
-		logger:     logger,
-		metrics:    metrics,
-	}, nil
 }
 
-func (r *redisRecorder) recordData(ctx context.Context, prefix, id, data string, compressedData []byte, tags map[string]string) error {
+func (r *redisRecorder) Save(ctx context.Context, record recorder.Record) error {
+	if record.RequestID == "" {
+		return fmt.Errorf("requestID cannot be empty")
+	}
+	if len(record.Payload) == 0 {
+		return fmt.Errorf("data cannot be nil or empty")
+	}
+
+	prefix, err := r.prefixFor(record.Type)
+	if err != nil {
+		return err
+	}
+
+	compressedData, err := r.compressor.compressData(record.Payload, r.options.CompressionLvl)
+	if err != nil {
+		return fmt.Errorf("failed to compress %s data: %w", prefix, err)
+	}
+
+	id := record.RequestID
+	if record.PrimaryID != nil && *record.PrimaryID != "" {
+		id = fmt.Sprintf("%s:%s", *record.PrimaryID, id)
+	}
+
+	tags := record.Tags
+	if tags == nil {
+		tags = make(map[string]string)
+	}
+	tags["request_id"] = id
+	tags["record_type"] = prefix
+
+	return r.recordData(ctx, prefix, id, compressedData, tags)
+}
+
+func (r *redisRecorder) Load(ctx context.Context, recordType recorder.RecordType, requestID string) ([]byte, error) {
+	if requestID == "" {
+		return nil, fmt.Errorf("requestID cannot be empty")
+	}
+
+	prefix, err := r.prefixFor(recordType)
+	if err != nil {
+		return nil, err
+	}
+
+	return r.getData(ctx, prefix, requestID)
+}
+
+func (r *redisRecorder) FindByTag(ctx context.Context, tag string) ([]string, error) {
+	if tag == "" {
+		return nil, fmt.Errorf("tag cannot be empty")
+	}
+
+	tagKey := fmt.Sprintf("%s:%s:%s", r.options.Prefix, TagsPrefix, tag)
+	tags, err := r.client.SMembers(ctx, tagKey).Result()
+	if err != nil {
+		return nil, fmt.Errorf("failed to find by tag: %w", err)
+	}
+	return tags, nil
+}
+
+func (r *redisRecorder) prefixFor(recordType recorder.RecordType) (string, error) {
+	switch recordType {
+	case recorder.RecordTypeRequest:
+		return RequestPrefix, nil
+	case recorder.RecordTypeResponse:
+		return ResponsePrefix, nil
+	case recorder.RecordTypeError:
+		return ErrorPrefix, nil
+	case recorder.RecordTypeMetrics:
+		return MetricsPrefix, nil
+	default:
+		return "", fmt.Errorf("unknown record type: %s", recordType)
+	}
+}
+
+func (r *redisRecorder) recordData(ctx context.Context, prefix, id string, compressedData []byte, tags map[string]string) error {
 	start := time.Now()
 	defer func() {
 		r.metrics.RecordTiming("redis.record_data.duration", time.Since(start), map[string]string{"prefix": prefix})
@@ -205,67 +291,6 @@ func (r *redisRecorder) recordData(ctx context.Context, prefix, id, data string,
 	r.metrics.IncrementCounter("redis.record_data.success", map[string]string{"prefix": prefix})
 	logger.Debug("data recorded successfully")
 	return r.updateTagIndex(ctx, tags, key)
-}
-
-func (r *redisRecorder) record(ctx context.Context, prefix string, primaryID *string, id string, data []byte, tags map[string]string) error {
-	if data == nil || len(data) == 0 {
-		return fmt.Errorf("data cannot be nil or empty")
-	}
-
-	compressedData, err := r.compressor.compressData(data, r.options.CompressionLvl)
-	if err != nil {
-		return fmt.Errorf("failed to compress %s data: %w", prefix, err)
-	}
-
-	if primaryID != nil {
-		id = fmt.Sprintf("%s:%s", *primaryID, id)
-	}
-
-	if tags == nil {
-		tags = make(map[string]string)
-	}
-	tags["request_id"] = id
-
-	return r.recordData(ctx, prefix, id, string(data), compressedData, tags)
-}
-
-func (r *redisRecorder) RecordRequest(ctx context.Context, primaryID *string, requestID string, request []byte, tags map[string]string) error {
-	if requestID == "" {
-		return fmt.Errorf("requestID cannot be empty")
-	}
-	return r.record(ctx, RequestPrefix, primaryID, requestID, request, tags)
-}
-
-func (r *redisRecorder) RecordResponse(ctx context.Context, primaryID *string, requestID string, response []byte, tags map[string]string) error {
-	if requestID == "" {
-		return fmt.Errorf("requestID cannot be empty")
-	}
-	return r.record(ctx, ResponsePrefix, primaryID, requestID, response, tags)
-}
-
-func (r *redisRecorder) RecordError(ctx context.Context, id *string, requestID string, err error, tags map[string]string) error {
-	if err == nil {
-		return fmt.Errorf("error cannot be nil")
-	}
-	if requestID == "" {
-		return fmt.Errorf("requestID cannot be empty")
-	}
-	return r.record(ctx, ErrorPrefix, id, requestID, []byte(err.Error()), tags)
-}
-
-func (r *redisRecorder) RecordMetrics(ctx context.Context, primaryID *string, requestID string, metrics map[string]string, tags map[string]string) error {
-	if requestID == "" {
-		return fmt.Errorf("requestID cannot be empty")
-	}
-	if metrics == nil || len(metrics) == 0 {
-		return fmt.Errorf("metrics cannot be nil or empty")
-	}
-
-	jsonData, err := json.Marshal(metrics)
-	if err != nil {
-		return fmt.Errorf("cannot marshal metrics: %w", err)
-	}
-	return r.record(ctx, MetricsPrefix, primaryID, requestID, jsonData, tags)
 }
 
 func (r *redisRecorder) getData(ctx context.Context, prefix, id string) ([]byte, error) {
@@ -299,97 +324,6 @@ func (r *redisRecorder) getData(ctx context.Context, prefix, id string) ([]byte,
 	r.metrics.IncrementCounter("redis.get_data.success", map[string]string{"prefix": prefix})
 	logger.Debug("data retrieved successfully", "data_size", len(decompressedData))
 	return decompressedData, nil
-}
-
-func (r *redisRecorder) GetRequest(ctx context.Context, requestID string) ([]byte, error) {
-	if requestID == "" {
-		return nil, fmt.Errorf("requestID cannot be empty")
-	}
-	return r.getData(ctx, RequestPrefix, requestID)
-}
-
-func (r *redisRecorder) GetResponse(ctx context.Context, requestID string) ([]byte, error) {
-	if requestID == "" {
-		return nil, fmt.Errorf("requestID cannot be empty")
-	}
-	return r.getData(ctx, ResponsePrefix, requestID)
-}
-
-func (r *redisRecorder) FindByTag(ctx context.Context, tag string) ([]string, error) {
-	if tag == "" {
-		return nil, fmt.Errorf("tag cannot be empty")
-	}
-
-	tagKey := fmt.Sprintf("%s:%s:%s", r.options.Prefix, TagsPrefix, tag)
-	tags, err := r.client.SMembers(ctx, tagKey).Result()
-	if err != nil {
-		return nil, fmt.Errorf("failed to find by tag: %w", err)
-	}
-	return tags, nil
-}
-
-func (r *redisRecorder) Async() recorder.AsyncRecorder {
-	return &asyncRecorder{r}
-}
-
-// Asynchronous Methods
-func (ar *asyncRecorder) RecordRequest(ctx context.Context, primaryID *string, requestID string, request []byte, tags map[string]string) <-chan error {
-	result := make(chan error, 1)
-	go func() {
-		result <- ar.redisRecorder.RecordRequest(ctx, primaryID, requestID, request, tags)
-	}()
-	return result
-}
-
-func (ar *asyncRecorder) RecordResponse(ctx context.Context, primaryID *string, requestID string, response []byte, tags map[string]string) <-chan error {
-	result := make(chan error, 1)
-	go func() {
-		result <- ar.redisRecorder.RecordResponse(ctx, primaryID, requestID, response, tags)
-	}()
-	return result
-}
-
-func (ar *asyncRecorder) RecordError(ctx context.Context, id *string, requestID string, err error, tags map[string]string) <-chan error {
-	result := make(chan error, 1)
-	go func() {
-		result <- ar.redisRecorder.RecordError(ctx, id, requestID, err, tags)
-	}()
-	return result
-}
-
-func (ar *asyncRecorder) RecordMetrics(ctx context.Context, primaryID *string, requestID string, metrics map[string]string, tags map[string]string) <-chan error {
-	result := make(chan error, 1)
-	go func() {
-		result <- ar.redisRecorder.RecordMetrics(ctx, primaryID, requestID, metrics, tags)
-	}()
-	return result
-}
-
-func (ar *asyncRecorder) GetRequest(ctx context.Context, requestID string) <-chan recorder.Result {
-	resultChan := make(chan recorder.Result, 1)
-	go func() {
-		data, err := ar.redisRecorder.GetRequest(ctx, requestID)
-		resultChan <- recorder.Result{Data: data, Err: err}
-	}()
-	return resultChan
-}
-
-func (ar *asyncRecorder) GetResponse(ctx context.Context, requestID string) <-chan recorder.Result {
-	resultChan := make(chan recorder.Result, 1)
-	go func() {
-		data, err := ar.redisRecorder.GetResponse(ctx, requestID)
-		resultChan <- recorder.Result{Data: data, Err: err}
-	}()
-	return resultChan
-}
-
-func (ar *asyncRecorder) FindByTag(ctx context.Context, tag string) <-chan recorder.FindByTagResult {
-	resultChan := make(chan recorder.FindByTagResult, 1)
-	go func() {
-		tags, err := ar.redisRecorder.FindByTag(ctx, tag)
-		resultChan <- recorder.FindByTagResult{Tags: tags, Err: err}
-	}()
-	return resultChan
 }
 
 func (r *redisRecorder) updateTagIndex(ctx context.Context, tags map[string]string, itemKey string) error {
