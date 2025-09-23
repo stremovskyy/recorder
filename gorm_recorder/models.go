@@ -64,7 +64,7 @@ func NewOptions[R RecordModel, T TagModel](recordFactory func() R, tagFactory fu
 		recordRequestIDColumn: "request_id",
 		tagTable:              "recorder_tags",
 		tagRecordIDColumn:     "record_id",
-		tagKeyColumn:          "tag_key",
+		tagKeyColumn:          "key",
 		tagValueColumn:        "value",
 	}
 }
@@ -138,9 +138,9 @@ func (o modelOptions[R, T]) prepare() (modelOptions[R, T], error) {
 	if prepared.tagRecordIDColumn == "" {
 		prepared.tagRecordIDColumn = "record_id"
 	}
-	// Default to non-reserved identifier for key column
+	// Default to actual column name used by default tag model
 	if prepared.tagKeyColumn == "" {
-		prepared.tagKeyColumn = "tag_key"
+		prepared.tagKeyColumn = "key"
 	}
 	if prepared.tagValueColumn == "" {
 		prepared.tagValueColumn = "value"
