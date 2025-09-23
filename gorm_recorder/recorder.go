@@ -3,6 +3,7 @@ package gorm_recorder
 import (
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -228,73 +229,123 @@ func (s *gormStorage[R, T]) saveRecord(ctx context.Context, record recorder.Reco
 
 // saveTags handles tag operations in optimized batches
 func (s *gormStorage[R, T]) saveTags(ctx context.Context, recordID uint, tags map[string]string) error {
-	// Use smaller, focused transactions for tags to reduce lock time
-	return s.db.WithContext(ctx).Transaction(
-		func(tx *gorm.DB) error {
-			// For MySQL, reduce gap locking by using READ COMMITTED for this short-living transaction
-			if tx.Dialector != nil && tx.Dialector.Name() == "mysql" {
-				// Ignore error if the server/role disallows changing tx level here
-				_ = tx.Exec("SET TRANSACTION ISOLATION LEVEL READ COMMITTED").Error
+	// Deterministic ordering to ensure consistent lock order
+	type kv struct{ k, v string }
+	ordered := make([]kv, 0, len(tags))
+	for k, v := range tags {
+		ordered = append(ordered, kv{k: k, v: v})
+	}
+	sort.Slice(
+		ordered, func(i, j int) bool {
+			if ordered[i].k == ordered[j].k {
+				return ordered[i].v < ordered[j].v
 			}
-
-			// Quick delete of existing tags to ensure idempotency
-			tagModel := s.opts.tagFactory()
-			if err := tx.Where(map[string]any{s.opts.tagRecordIDColumn: recordID}).Delete(tagModel).Error; err != nil {
-				return err
-			}
-
-			if len(tags) == 0 {
-				return nil
-			}
-
-			// Convert map to a deterministically ordered slice to avoid deadlocks by consistent lock order
-			type kv struct{ k, v string }
-			ordered := make([]kv, 0, len(tags))
-			for k, v := range tags {
-				ordered = append(ordered, kv{k: k, v: v})
-			}
-			sort.Slice(
-				ordered, func(i, j int) bool {
-					if ordered[i].k == ordered[j].k {
-						return ordered[i].v < ordered[j].v
-					}
-					return ordered[i].k < ordered[j].k
-				},
-			)
-
-			// Build tag models in the same order
-			tagModels := make([]T, 0, len(ordered))
-			for _, p := range ordered {
-				tag := s.opts.tagFactory()
-				tag.SetRecordID(recordID)
-				tag.SetKey(p.k)
-				tag.SetValue(p.v)
-				tagModels = append(tagModels, tag)
-			}
-
-			// Insert in small, deterministic batches to reduce lock duration
-			const optimalBatchSize = 2
-			for i := 0; i < len(tagModels); i += optimalBatchSize {
-				end := i + optimalBatchSize
-				if end > len(tagModels) {
-					end = len(tagModels)
-				}
-				batch := tagModels[i:end]
-
-				qb := tx
-				if tx.Dialector != nil && tx.Dialector.Name() == "mysql" {
-					// Lower lock priority a bit to reduce deadlocks under contention
-					qb = qb.Clauses(clause.Insert{Modifier: "LOW_PRIORITY"})
-				}
-
-				if err := qb.CreateInBatches(&batch, optimalBatchSize).Error; err != nil {
-					return err
-				}
-			}
-
-			return nil
+			return ordered[i].k < ordered[j].k
 		},
 	)
+
+	keys := make([]string, 0, len(ordered))
+	for _, p := range ordered {
+		keys = append(keys, p.k)
+	}
+
+	base := s.db.WithContext(ctx)
+
+	// Begin a short transaction; for MySQL, use READ COMMITTED to reduce gap locks
+	var tx *gorm.DB
+	if base.Dialector != nil && base.Dialector.Name() == "mysql" {
+		tx = base.Begin(&sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	} else {
+		tx = base.Begin()
+	}
+	if tx.Error != nil {
+		return tx.Error
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			_ = tx.Rollback()
+			panic(r)
+		}
+	}()
+
+	// For MySQL: lock the parent record row to serialize concurrent updates for the same record
+	if base.Dialector != nil && base.Dialector.Name() == "mysql" {
+		lockSQL := fmt.Sprintf("SELECT 1 FROM %s WHERE %s = ? FOR UPDATE", s.opts.recordTable, s.opts.recordIDColumn)
+		if err := tx.Exec(lockSQL, recordID).Error; err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+	}
+
+	if len(tags) == 0 {
+		// No tags requested: remove all tags for this record
+		if err := tx.Table(s.opts.tagTable).
+			Where(fmt.Sprintf("%s = ?", s.opts.tagRecordIDColumn), recordID).
+			Delete(s.opts.tagFactory()).Error; err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+		return tx.Commit().Error
+	}
+
+	// 1) Remove tags that are no longer present
+	if err := tx.Table(s.opts.tagTable).
+		Where(fmt.Sprintf("%s = ?", s.opts.tagRecordIDColumn), recordID).
+		Where(fmt.Sprintf("%s NOT IN ?", s.opts.tagKeyColumn), keys).
+		Delete(s.opts.tagFactory()).Error; err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+
+	// 2) Remove keys that will be updated to avoid duplicates (applies to all dialects for safety)
+	if err := tx.Table(s.opts.tagTable).
+		Where(fmt.Sprintf("%s = ?", s.opts.tagRecordIDColumn), recordID).
+		Where(fmt.Sprintf("%s IN ?", s.opts.tagKeyColumn), keys).
+		Delete(s.opts.tagFactory()).Error; err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+
+	// 3) Build models in deterministic order
+	tagModels := make([]T, 0, len(ordered))
+	for _, p := range ordered {
+		tag := s.opts.tagFactory()
+		tag.SetRecordID(recordID)
+		tag.SetKey(p.k)
+		tag.SetValue(p.v)
+		tagModels = append(tagModels, tag)
+	}
+
+	// 4) Insert/update; on MySQL insert per row to minimize lock time; keep upsert to cover races
+	batchSize := 5
+	if base.Dialector != nil && base.Dialector.Name() == "mysql" {
+		batchSize = 1
+	}
+
+	for i := 0; i < len(tagModels); i += batchSize {
+		end := i + batchSize
+		if end > len(tagModels) {
+			end = len(tagModels)
+		}
+		batch := tagModels[i:end]
+
+		qb := tx
+		if base.Dialector != nil && base.Dialector.Name() == "mysql" {
+			qb = qb.Clauses(
+				clause.OnConflict{
+					Columns:   []clause.Column{{Name: s.opts.tagRecordIDColumn}, {Name: s.opts.tagKeyColumn}},
+					DoUpdates: clause.AssignmentColumns([]string{s.opts.tagValueColumn}),
+				},
+			)
+		}
+
+		if err := qb.CreateInBatches(&batch, batchSize).Error; err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+	}
+
+	return tx.Commit().Error
 }
 
 // Enhanced deadlock detection with more patterns
@@ -399,8 +450,8 @@ type recordModel struct {
 
 type recordTag struct {
 	ID       uint   `gorm:"primaryKey"`
-	RecordID uint   `gorm:"index;not null"`
-	Key      string `gorm:"size:128;not null;index:idx_tag_key_value,priority:1"`
+	RecordID uint   `gorm:"index;not null;uniqueIndex:uidx_record_key,priority:1"`
+	Key      string `gorm:"size:128;not null;index:idx_tag_key_value,priority:1;uniqueIndex:uidx_record_key,priority:2"`
 	Value    string `gorm:"size:512;not null;index:idx_tag_key_value,priority:2"`
 }
 
