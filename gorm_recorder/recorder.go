@@ -2,14 +2,24 @@ package gorm_recorder
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"gorm.io/gorm"
 
 	"github.com/stremovskyy/recorder"
+)
+
+// Global counters for adaptive retry strategy
+var (
+	deadlockCounter int64
+	successCounter  int64
 )
 
 type gormStorage[R RecordModel, T TagModel] struct {
@@ -57,69 +67,226 @@ func (s *gormStorage[R, T]) Save(ctx context.Context, record recorder.Record) er
 		return fmt.Errorf("gorm recorder: payload cannot be empty")
 	}
 
-	tx := s.db.WithContext(ctx).Begin()
-	if tx.Error != nil {
-		return tx.Error
+	// Adaptive retry configuration based on deadlock frequency
+	maxRetries := s.calculateAdaptiveRetries()
+	baseDelay := s.calculateAdaptiveDelay()
+
+	var lastErr error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			delay := s.calculateBackoffDelay(attempt, baseDelay)
+
+			select {
+			case <-time.After(delay):
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+
+		err := s.saveWithOptimizedTransaction(ctx, record)
+		if err == nil {
+			atomic.AddInt64(&successCounter, 1)
+			return nil
+		}
+
+		// Check if it's a deadlock error
+		if isDeadlockError(err) {
+			atomic.AddInt64(&deadlockCounter, 1)
+			lastErr = err
+			continue
+		}
+
+		// If it's not a deadlock, return immediately
+		return err
 	}
 
-	model := s.opts.recordFactory()
-	err := tx.Where(map[string]any{
-		s.opts.recordTypeColumn:      string(record.Type),
-		s.opts.recordRequestIDColumn: record.RequestID,
-	}).First(model).Error
+	return fmt.Errorf("gorm recorder: failed after %d retries due to deadlocks: %w", maxRetries, lastErr)
+}
+
+// calculateAdaptiveRetries adjusts retry count based on deadlock frequency
+func (s *gormStorage[R, T]) calculateAdaptiveRetries() int {
+	deadlocks := atomic.LoadInt64(&deadlockCounter)
+	successes := atomic.LoadInt64(&successCounter)
+
+	if successes == 0 {
+		return 5 // Default when no data
+	}
+
+	deadlockRate := float64(deadlocks) / float64(deadlocks+successes)
 
 	switch {
-	case err == nil:
-		// existing record loaded
-	case errors.Is(err, gorm.ErrRecordNotFound):
-		model.SetType(string(record.Type))
-		model.SetRequestID(record.RequestID)
-	case err != nil:
-		tx.Rollback()
+	case deadlockRate > 0.1: // High contention
+		return 8
+	case deadlockRate > 0.05: // Medium contention
+		return 6
+	default: // Low contention
+		return 3
+	}
+}
+
+// calculateAdaptiveDelay adjusts base delay based on system load
+func (s *gormStorage[R, T]) calculateAdaptiveDelay() time.Duration {
+	deadlocks := atomic.LoadInt64(&deadlockCounter)
+	successes := atomic.LoadInt64(&successCounter)
+
+	if successes == 0 {
+		return 100 * time.Millisecond
+	}
+
+	deadlockRate := float64(deadlocks) / float64(deadlocks+successes)
+
+	switch {
+	case deadlockRate > 0.1:
+		return 200 * time.Millisecond // Longer delays for high contention
+	case deadlockRate > 0.05:
+		return 150 * time.Millisecond
+	default:
+		return 50 * time.Millisecond
+	}
+}
+
+// calculateBackoffDelay uses exponential backoff with crypto-random jitter
+func (s *gormStorage[R, T]) calculateBackoffDelay(attempt int, baseDelay time.Duration) time.Duration {
+	// Exponential backoff with cap
+	multiplier := math.Pow(2, float64(attempt-1))
+	if multiplier > 16 { // Cap at 16x base delay
+		multiplier = 16
+	}
+
+	delay := time.Duration(float64(baseDelay) * multiplier)
+
+	// Crypto-random jitter to avoid thundering herd
+	jitterBytes := make([]byte, 8)
+	if _, err := rand.Read(jitterBytes); err == nil {
+		jitterValue := binary.BigEndian.Uint64(jitterBytes)
+		maxJitter := int64(delay / 2)
+		if maxJitter > 0 {
+			jitter := time.Duration(int64(jitterValue) % maxJitter)
+			delay += jitter
+		}
+	}
+
+	return delay
+}
+
+// saveWithOptimizedTransaction splits the transaction to reduce lock scope
+func (s *gormStorage[R, T]) saveWithOptimizedTransaction(ctx context.Context, record recorder.Record) error {
+	// Step 1: Save/Update the main record first
+	recordID, err := s.saveRecord(ctx, record)
+	if err != nil {
 		return err
 	}
 
-	model.SetPrimaryID(record.PrimaryID)
-	model.SetPayload(record.Payload)
-
-	if err := tx.Save(model).Error; err != nil {
-		tx.Rollback()
-		return err
-	}
-
-	recordID := model.GetID()
-
-	tagModel := s.opts.tagFactory()
-	if err := tx.Where(map[string]any{s.opts.tagRecordIDColumn: recordID}).Delete(tagModel).Error; err != nil {
-		tx.Rollback()
-		return err
-	}
-
+	// Step 2: Handle tags in a separate, shorter transaction
 	if len(record.Tags) > 0 {
-		tags := make([]T, 0, len(record.Tags))
-		for key, value := range record.Tags {
-			tag := s.opts.tagFactory()
-			tag.SetRecordID(recordID)
-			tag.SetKey(key)
-			tag.SetValue(value)
-			tags = append(tags, tag)
-		}
-		if err := tx.Create(&tags).Error; err != nil {
-			tx.Rollback()
-			return err
-		}
+		return s.saveTags(ctx, recordID, record.Tags)
 	}
 
-	return tx.Commit().Error
+	return nil
+}
+
+// saveRecord handles the main record in a focused transaction
+func (s *gormStorage[R, T]) saveRecord(ctx context.Context, record recorder.Record) (uint, error) {
+	var recordID uint
+
+	err := s.db.WithContext(ctx).Transaction(
+		func(tx *gorm.DB) error {
+			model := s.opts.recordFactory()
+			err := tx.Where(
+				map[string]any{
+					s.opts.recordTypeColumn:      string(record.Type),
+					s.opts.recordRequestIDColumn: record.RequestID,
+				},
+			).First(model).Error
+
+			switch {
+			case err == nil:
+				// existing record loaded
+			case errors.Is(err, gorm.ErrRecordNotFound):
+				model.SetType(string(record.Type))
+				model.SetRequestID(record.RequestID)
+			default:
+				return err
+			}
+
+			model.SetPrimaryID(record.PrimaryID)
+			model.SetPayload(record.Payload)
+
+			if err := tx.Save(model).Error; err != nil {
+				return err
+			}
+
+			recordID = model.GetID()
+			return nil
+		},
+	)
+
+	return recordID, err
+}
+
+// saveTags handles tag operations in optimized batches
+func (s *gormStorage[R, T]) saveTags(ctx context.Context, recordID uint, tags map[string]string) error {
+	// Use smaller, focused transactions for tags to reduce lock time
+	return s.db.WithContext(ctx).Transaction(
+		func(tx *gorm.DB) error {
+			// Quick delete of existing tags
+			tagModel := s.opts.tagFactory()
+			if err := tx.Where(map[string]any{s.opts.tagRecordIDColumn: recordID}).Delete(tagModel).Error; err != nil {
+				return err
+			}
+
+			// Convert tags to slice for batch processing
+			tagModels := make([]T, 0, len(tags))
+			for key, value := range tags {
+				tag := s.opts.tagFactory()
+				tag.SetRecordID(recordID)
+				tag.SetKey(key)
+				tag.SetValue(value)
+				tagModels = append(tagModels, tag)
+			}
+
+			// Insert in optimized batches
+			const optimalBatchSize = 5 // Smaller batches for less lock time
+			for i := 0; i < len(tagModels); i += optimalBatchSize {
+				end := i + optimalBatchSize
+				if end > len(tagModels) {
+					end = len(tagModels)
+				}
+				batch := tagModels[i:end]
+
+				// Use CreateInBatches for better performance
+				if err := tx.CreateInBatches(&batch, optimalBatchSize).Error; err != nil {
+					return err
+				}
+			}
+
+			return nil
+		},
+	)
+}
+
+// Enhanced deadlock detection with more patterns
+func isDeadlockError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := strings.ToLower(err.Error())
+	return strings.Contains(errStr, "error 1213") ||
+		strings.Contains(errStr, "deadlock found when trying to get lock") ||
+		strings.Contains(errStr, "deadlock") ||
+		strings.Contains(errStr, "lock wait timeout") ||
+		strings.Contains(errStr, "error 1205") // Lock wait timeout
 }
 
 func (s *gormStorage[R, T]) Load(ctx context.Context, recordType recorder.RecordType, requestID string) ([]byte, error) {
 	model := s.opts.recordFactory()
 	err := s.db.WithContext(ctx).
-		Where(map[string]any{
-			s.opts.recordTypeColumn:      string(recordType),
-			s.opts.recordRequestIDColumn: requestID,
-		}).
+		Where(
+			map[string]any{
+				s.opts.recordTypeColumn:      string(recordType),
+				s.opts.recordRequestIDColumn: requestID,
+			},
+		).
 		First(model).Error
 	if err != nil {
 		return nil, err
@@ -139,16 +306,19 @@ func (s *gormStorage[R, T]) FindByTag(ctx context.Context, tag string) ([]string
 		return nil, err
 	}
 
-	selectClause := fmt.Sprintf("%s.%s AS record_type, %s.%s AS request_id",
+	selectClause := fmt.Sprintf(
+		"%s.%s AS record_type, %s.%s AS request_id",
 		s.opts.recordTable, s.opts.recordTypeColumn,
 		s.opts.recordTable, s.opts.recordRequestIDColumn,
 	)
-	joinClause := fmt.Sprintf("JOIN %s ON %s.%s = %s.%s",
+	joinClause := fmt.Sprintf(
+		"JOIN %s ON %s.%s = %s.%s",
 		s.opts.recordTable,
 		s.opts.recordTable, s.opts.recordIDColumn,
 		s.opts.tagTable, s.opts.tagRecordIDColumn,
 	)
-	whereClause := fmt.Sprintf("%s.%s = ? AND %s.%s = ?",
+	whereClause := fmt.Sprintf(
+		"%s.%s = ? AND %s.%s = ?",
 		s.opts.tagTable, s.opts.tagKeyColumn,
 		s.opts.tagTable, s.opts.tagValueColumn,
 	)
