@@ -7,11 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"github.com/stremovskyy/recorder"
 )
@@ -229,24 +231,49 @@ func (s *gormStorage[R, T]) saveTags(ctx context.Context, recordID uint, tags ma
 	// Use smaller, focused transactions for tags to reduce lock time
 	return s.db.WithContext(ctx).Transaction(
 		func(tx *gorm.DB) error {
-			// Quick delete of existing tags
+			// For MySQL, reduce gap locking by using READ COMMITTED for this short-living transaction
+			if tx.Dialector != nil && tx.Dialector.Name() == "mysql" {
+				// Ignore error if the server/role disallows changing tx level here
+				_ = tx.Exec("SET TRANSACTION ISOLATION LEVEL READ COMMITTED").Error
+			}
+
+			// Quick delete of existing tags to ensure idempotency
 			tagModel := s.opts.tagFactory()
 			if err := tx.Where(map[string]any{s.opts.tagRecordIDColumn: recordID}).Delete(tagModel).Error; err != nil {
 				return err
 			}
 
-			// Convert tags to slice for batch processing
-			tagModels := make([]T, 0, len(tags))
-			for key, value := range tags {
+			if len(tags) == 0 {
+				return nil
+			}
+
+			// Convert map to a deterministically ordered slice to avoid deadlocks by consistent lock order
+			type kv struct{ k, v string }
+			ordered := make([]kv, 0, len(tags))
+			for k, v := range tags {
+				ordered = append(ordered, kv{k: k, v: v})
+			}
+			sort.Slice(
+				ordered, func(i, j int) bool {
+					if ordered[i].k == ordered[j].k {
+						return ordered[i].v < ordered[j].v
+					}
+					return ordered[i].k < ordered[j].k
+				},
+			)
+
+			// Build tag models in the same order
+			tagModels := make([]T, 0, len(ordered))
+			for _, p := range ordered {
 				tag := s.opts.tagFactory()
 				tag.SetRecordID(recordID)
-				tag.SetKey(key)
-				tag.SetValue(value)
+				tag.SetKey(p.k)
+				tag.SetValue(p.v)
 				tagModels = append(tagModels, tag)
 			}
 
-			// Insert in optimized batches
-			const optimalBatchSize = 5 // Smaller batches for less lock time
+			// Insert in small, deterministic batches to reduce lock duration
+			const optimalBatchSize = 2
 			for i := 0; i < len(tagModels); i += optimalBatchSize {
 				end := i + optimalBatchSize
 				if end > len(tagModels) {
@@ -254,8 +281,13 @@ func (s *gormStorage[R, T]) saveTags(ctx context.Context, recordID uint, tags ma
 				}
 				batch := tagModels[i:end]
 
-				// Use CreateInBatches for better performance
-				if err := tx.CreateInBatches(&batch, optimalBatchSize).Error; err != nil {
+				qb := tx
+				if tx.Dialector != nil && tx.Dialector.Name() == "mysql" {
+					// Lower lock priority a bit to reduce deadlocks under contention
+					qb = qb.Clauses(clause.Insert{Modifier: "LOW_PRIORITY"})
+				}
+
+				if err := qb.CreateInBatches(&batch, optimalBatchSize).Error; err != nil {
 					return err
 				}
 			}
