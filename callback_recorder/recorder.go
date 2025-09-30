@@ -19,8 +19,8 @@ type Options struct {
 	Find FindFunc
 }
 
-func New(opts Options) recorder.Recorder {
-	return recorder.New(&callbackStorage{opts: opts})
+func New(opts Options, recorderOpts ...recorder.RecorderOption) recorder.Recorder {
+	return recorder.New(&callbackStorage{opts: opts}, recorderOpts...)
 }
 
 type callbackStorage struct {

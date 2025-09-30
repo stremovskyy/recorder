@@ -16,11 +16,12 @@ type fileStorage struct {
 }
 
 // NewFileRecorder creates a Recorder backed by local file storage.
-func NewFileRecorder(basePath string) recorder.Recorder {
+func NewFileRecorder(basePath string, recorderOpts ...recorder.RecorderOption) recorder.Recorder {
 	return recorder.New(
 		&fileStorage{
 			basePath: basePath,
 		},
+		recorderOpts...,
 	)
 }
 

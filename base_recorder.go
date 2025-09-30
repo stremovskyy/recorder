@@ -33,15 +33,30 @@ type Storage interface {
 }
 
 // New constructs a Recorder backed by the provided Storage implementation.
-func New(storage Storage) Recorder {
+func New(storage Storage, opts ...RecorderOption) Recorder {
 	if storage == nil {
 		panic("recorder: storage must not be nil")
 	}
-	return &baseRecorder{storage: storage}
+
+	var cfg recorderOptions
+	for _, opt := range opts {
+		if opt == nil {
+			continue
+		}
+		opt(&cfg)
+	}
+
+	return &baseRecorder{
+		storage:         storage,
+		payloadScrubber: cfg.payloadScrubber,
+		tagScrubber:     cfg.tagScrubber,
+	}
 }
 
 type baseRecorder struct {
-	storage Storage
+	storage         Storage
+	payloadScrubber PayloadScrubFunc
+	tagScrubber     TagScrubFunc
 }
 
 func (r *baseRecorder) RecordRequest(ctx context.Context, primaryID *string, requestID string, request []byte, tags map[string]string) error {
@@ -52,12 +67,21 @@ func (r *baseRecorder) RecordRequest(ctx context.Context, primaryID *string, req
 		return fmt.Errorf("request cannot be nil or empty")
 	}
 
+	sanitizedPayload, err := r.scrubPayload(RecordTypeRequest, request)
+	if err != nil {
+		return fmt.Errorf("scrub request payload: %w", err)
+	}
+	sanitizedTags, err := r.prepareTags(RecordTypeRequest, tags)
+	if err != nil {
+		return fmt.Errorf("scrub request tags: %w", err)
+	}
+
 	return r.storage.Save(ctx, Record{
 		Type:      RecordTypeRequest,
 		PrimaryID: primaryID,
 		RequestID: requestID,
-		Payload:   request,
-		Tags:      cloneTags(tags),
+		Payload:   sanitizedPayload,
+		Tags:      sanitizedTags,
 	})
 }
 
@@ -69,12 +93,21 @@ func (r *baseRecorder) RecordResponse(ctx context.Context, primaryID *string, re
 		return fmt.Errorf("response cannot be nil or empty")
 	}
 
+	sanitizedPayload, err := r.scrubPayload(RecordTypeResponse, response)
+	if err != nil {
+		return fmt.Errorf("scrub response payload: %w", err)
+	}
+	sanitizedTags, err := r.prepareTags(RecordTypeResponse, tags)
+	if err != nil {
+		return fmt.Errorf("scrub response tags: %w", err)
+	}
+
 	return r.storage.Save(ctx, Record{
 		Type:      RecordTypeResponse,
 		PrimaryID: primaryID,
 		RequestID: requestID,
-		Payload:   response,
-		Tags:      cloneTags(tags),
+		Payload:   sanitizedPayload,
+		Tags:      sanitizedTags,
 	})
 }
 
@@ -86,12 +119,21 @@ func (r *baseRecorder) RecordError(ctx context.Context, id *string, requestID st
 		return fmt.Errorf("requestID cannot be empty")
 	}
 
+	sanitizedPayload, scrubErr := r.scrubPayload(RecordTypeError, []byte(err.Error()))
+	if scrubErr != nil {
+		return fmt.Errorf("scrub error payload: %w", scrubErr)
+	}
+	sanitizedTags, scrubErr := r.prepareTags(RecordTypeError, tags)
+	if scrubErr != nil {
+		return fmt.Errorf("scrub error tags: %w", scrubErr)
+	}
+
 	return r.storage.Save(ctx, Record{
 		Type:      RecordTypeError,
 		PrimaryID: id,
 		RequestID: requestID,
-		Payload:   []byte(err.Error()),
-		Tags:      cloneTags(tags),
+		Payload:   sanitizedPayload,
+		Tags:      sanitizedTags,
 	})
 }
 
@@ -107,13 +149,21 @@ func (r *baseRecorder) RecordMetrics(ctx context.Context, primaryID *string, req
 	if err != nil {
 		return fmt.Errorf("cannot marshal metrics: %w", err)
 	}
+	sanitizedPayload, scrubErr := r.scrubPayload(RecordTypeMetrics, jsonData)
+	if scrubErr != nil {
+		return fmt.Errorf("scrub metrics payload: %w", scrubErr)
+	}
+	sanitizedTags, scrubErr := r.prepareTags(RecordTypeMetrics, tags)
+	if scrubErr != nil {
+		return fmt.Errorf("scrub metrics tags: %w", scrubErr)
+	}
 
 	return r.storage.Save(ctx, Record{
 		Type:      RecordTypeMetrics,
 		PrimaryID: primaryID,
 		RequestID: requestID,
-		Payload:   jsonData,
-		Tags:      cloneTags(tags),
+		Payload:   sanitizedPayload,
+		Tags:      sanitizedTags,
 	})
 }
 
@@ -203,6 +253,21 @@ func (ar *asyncRecorder) FindByTag(ctx context.Context, tag string) <-chan FindB
 		resultChan <- FindByTagResult{Tags: tags, Err: err}
 	}()
 	return resultChan
+}
+
+func (r *baseRecorder) scrubPayload(recordType RecordType, payload []byte) ([]byte, error) {
+	if r.payloadScrubber == nil || len(payload) == 0 {
+		return payload, nil
+	}
+	return r.payloadScrubber(recordType, append([]byte(nil), payload...))
+}
+
+func (r *baseRecorder) prepareTags(recordType RecordType, tags map[string]string) (map[string]string, error) {
+	cloned := cloneTags(tags)
+	if r.tagScrubber == nil || len(cloned) == 0 {
+		return cloned, nil
+	}
+	return r.tagScrubber(recordType, cloned)
 }
 
 func cloneTags(tags map[string]string) map[string]string {

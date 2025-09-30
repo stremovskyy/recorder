@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"testing"
 )
 
@@ -277,6 +278,129 @@ func TestFindByTagValidation(t *testing.T) {
 	rec := New(stubStorage{})
 	if _, err := rec.FindByTag(context.Background(), ""); err == nil {
 		t.Fatal("expected error for empty tag")
+	}
+}
+
+func TestPayloadScrubberApplied(t *testing.T) {
+	ctx := context.Background()
+	original := []byte("raw")
+	var stored Record
+	storage := stubStorage{
+		saveFn: func(_ context.Context, record Record) error {
+			stored = record
+			return nil
+		},
+	}
+
+	rec := New(storage, WithPayloadScrubber(func(recordType RecordType, payload []byte) ([]byte, error) {
+		if recordType != RecordTypeRequest {
+			t.Fatalf("unexpected record type sent to scrubber: %s", recordType)
+		}
+		for i := range payload {
+			payload[i] = 'x'
+		}
+		return payload, nil
+	}))
+
+	if err := rec.RecordRequest(ctx, nil, "req", original, nil); err != nil {
+		t.Fatalf("RecordRequest returned error: %v", err)
+	}
+	if string(original) != "raw" {
+		t.Fatalf("expected original payload to remain unchanged, got %q", string(original))
+	}
+	if string(stored.Payload) != "xxx" {
+		t.Fatalf("expected stored payload to be scrubbed, got %q", string(stored.Payload))
+	}
+}
+
+func TestTagScrubberApplied(t *testing.T) {
+	ctx := context.Background()
+	originalTags := map[string]string{"token": "secret", "keep": "ok"}
+	var stored Record
+	storage := stubStorage{
+		saveFn: func(_ context.Context, record Record) error {
+			stored = record
+			return nil
+		},
+	}
+
+	rec := New(storage, WithTagScrubber(func(recordType RecordType, tags map[string]string) (map[string]string, error) {
+		if recordType != RecordTypeResponse {
+			t.Fatalf("unexpected record type sent to tag scrubber: %s", recordType)
+		}
+		tags["token"] = "redacted"
+		delete(tags, "keep")
+		tags["new"] = "value"
+		return tags, nil
+	}))
+
+	if err := rec.RecordResponse(ctx, nil, "req", []byte("body"), originalTags); err != nil {
+		t.Fatalf("RecordResponse returned error: %v", err)
+	}
+	if !reflect.DeepEqual(originalTags, map[string]string{"token": "secret", "keep": "ok"}) {
+		t.Fatalf("expected original tags to remain unchanged, got %#v", originalTags)
+	}
+	if !reflect.DeepEqual(stored.Tags, map[string]string{"token": "redacted", "new": "value"}) {
+		t.Fatalf("unexpected scrubbed tags: %#v", stored.Tags)
+	}
+}
+
+func TestPayloadScrubberErrorStopsRecording(t *testing.T) {
+	ctx := context.Background()
+	warnErr := errors.New("scrub failed")
+	storage := stubStorage{
+		saveFn: func(_ context.Context, _ Record) error {
+			t.Fatalf("save should not be called when scrubbing fails")
+			return nil
+		},
+	}
+
+	rec := New(storage, WithPayloadScrubber(func(recordType RecordType, payload []byte) ([]byte, error) {
+		return nil, warnErr
+	}))
+
+	err := rec.RecordResponse(ctx, nil, "req", []byte("body"), nil)
+	if err == nil {
+		t.Fatal("expected scrubbing error, got nil")
+	}
+	if !errors.Is(err, warnErr) {
+		t.Fatalf("expected error to wrap scrub error, got %v", err)
+	}
+}
+
+func TestWithScrubberAppliesDefaults(t *testing.T) {
+	ctx := context.Background()
+	var stored Record
+	storage := stubStorage{
+		saveFn: func(_ context.Context, record Record) error {
+			stored = record
+			return nil
+		},
+	}
+
+	s := NewScrubber()
+	rec := New(storage, WithScrubber(s))
+	payload := []byte("{\"token\":\"abc\",\"value\":\"ok\"}")
+	tags := map[string]string{"token": "abc", "other": "ok"}
+
+	if err := rec.RecordRequest(ctx, nil, "req", payload, tags); err != nil {
+		t.Fatalf("RecordRequest returned error: %v", err)
+	}
+	var parsed map[string]string
+	if err := json.Unmarshal(stored.Payload, &parsed); err != nil {
+		t.Fatalf("failed to decode scrubbed payload: %v", err)
+	}
+	if parsed["token"] != "[REDACTED]" {
+		t.Fatalf("expected token to be scrubbed, got %q", parsed["token"])
+	}
+	if parsed["value"] != "ok" {
+		t.Fatalf("expected value to remain, got %q", parsed["value"])
+	}
+	if stored.Tags["token"] != "[REDACTED]" {
+		t.Fatalf("expected tag token to be scrubbed, got %q", stored.Tags["token"])
+	}
+	if stored.Tags["other"] != "ok" {
+		t.Fatalf("expected non-sensitive tag to remain, got %q", stored.Tags["other"])
 	}
 }
 

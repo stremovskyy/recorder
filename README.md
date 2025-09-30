@@ -58,6 +58,47 @@ type AsyncRecorder interface {
 func New(storage Storage) Recorder
 ```
 
+### Sensitive Data Scrubber
+
+Use the scrubber utilities when you need to strip secrets before persisting payloads.
+
+```go
+scrub := recorder.NewScrubber()
+payload := map[string]any{
+    "password": "super-secret",
+    "headers": map[string][]string{"Authorization": []string{"Bearer token"}},
+}
+masked := scrub.Scrub(payload).(map[string]any)
+// masked["password"] == "[REDACTED]"
+
+storage := yourStorage{} // implements recorder.Storage
+rec := recorder.New(storage, recorder.WithScrubber(scrub))
+_ = rec.RecordRequest(ctx, nil, "req-42", []byte(`{"token":"abc"}`), nil)
+```
+
+You can tailor which fields are scrubbed and how the data is transformed by declaring rules:
+
+```go
+scrub := recorder.NewScrubber(
+    recorder.WithDefaultReplacement("<hidden>"),
+    recorder.WithoutDefaultRules(),
+)
+scrub.AddRules(
+    recorder.NewRule(
+        "mask-token",
+        recorder.MatchPathInsensitive("credentials.token"),
+        recorder.MaskString('*', 0, 4),
+    ),
+)
+
+rec := recorder.New(
+    storage,
+    recorder.WithScrubber(scrub, recorder.ScrubberFailOnError()),
+)
+```
+
+For non-JSON payloads or advanced logic, supply your own sanitizers with `recorder.WithPayloadScrubber` or `recorder.WithTagScrubber`.
+
 ### Redis Implementation
 #### Usage
 

@@ -31,25 +31,25 @@ type gormStorage[R RecordModel, T TagModel] struct {
 }
 
 // NewRecorder constructs a recorder backed by GORM using the default models provided by the package.
-func NewRecorder(db *gorm.DB) (recorder.Recorder, error) {
+func NewRecorder(db *gorm.DB, recorderOpts ...recorder.RecorderOption) (recorder.Recorder, error) {
 	defaultOpts := NewOptions(func() *recordModel { return &recordModel{} }, func() *recordTag { return &recordTag{} })
 	prepared, err := defaultOpts.prepare()
 	if err != nil {
 		return nil, err
 	}
-	return newRecorderWithPreparedOptions[*recordModel, *recordTag](db, prepared)
+	return newRecorderWithPreparedOptions[*recordModel, *recordTag](db, prepared, recorderOpts...)
 }
 
 // NewRecorderWithModels constructs a recorder backed by GORM using the supplied model abstraction.
-func NewRecorderWithModels[R RecordModel, T TagModel](db *gorm.DB, opts modelOptions[R, T]) (recorder.Recorder, error) {
+func NewRecorderWithModels[R RecordModel, T TagModel](db *gorm.DB, opts modelOptions[R, T], recorderOpts ...recorder.RecorderOption) (recorder.Recorder, error) {
 	prepared, err := opts.prepare()
 	if err != nil {
 		return nil, err
 	}
-	return newRecorderWithPreparedOptions[R, T](db, prepared)
+	return newRecorderWithPreparedOptions[R, T](db, prepared, recorderOpts...)
 }
 
-func newRecorderWithPreparedOptions[R RecordModel, T TagModel](db *gorm.DB, opts modelOptions[R, T]) (recorder.Recorder, error) {
+func newRecorderWithPreparedOptions[R RecordModel, T TagModel](db *gorm.DB, opts modelOptions[R, T], recorderOpts ...recorder.RecorderOption) (recorder.Recorder, error) {
 	if db == nil {
 		return nil, fmt.Errorf("gorm recorder: db must not be nil")
 	}
@@ -62,7 +62,7 @@ func newRecorderWithPreparedOptions[R RecordModel, T TagModel](db *gorm.DB, opts
 		db:   db,
 		opts: opts,
 	}
-	return recorder.New(storage), nil
+	return recorder.New(storage, recorderOpts...), nil
 }
 
 func (s *gormStorage[R, T]) Save(ctx context.Context, record recorder.Record) error {

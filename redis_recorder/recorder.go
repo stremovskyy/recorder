@@ -96,8 +96,8 @@ func (c *compressor) decompressData(compressedData []byte) ([]byte, error) {
 	return decompressedData, nil
 }
 
-func NewRedisRecorder(options *Options) recorder.Recorder {
-	rec, err := NewRedisRecorderWithValidation(options)
+func NewRedisRecorder(options *Options, recorderOpts ...recorder.RecorderOption) recorder.Recorder {
+	rec, err := NewRedisRecorderWithValidation(options, recorderOpts...)
 	if err != nil {
 		log.Printf("failed to create redis recorder: %v", err)
 		return nil
@@ -105,7 +105,7 @@ func NewRedisRecorder(options *Options) recorder.Recorder {
 	return rec
 }
 
-func NewRedisRecorderWithValidation(options *Options) (recorder.Recorder, error) {
+func NewRedisRecorderWithValidation(options *Options, recorderOpts ...recorder.RecorderOption) (recorder.Recorder, error) {
 	if options == nil {
 		return nil, fmt.Errorf("redis recorder: options must not be nil")
 	}
@@ -150,7 +150,7 @@ func NewRedisRecorderWithValidation(options *Options) (recorder.Recorder, error)
 		metrics:    metrics,
 	}
 
-	return recorder.New(storage), nil
+	return recorder.New(storage, recorderOpts...), nil
 }
 
 func applyRedisDefaults(options *Options) {
